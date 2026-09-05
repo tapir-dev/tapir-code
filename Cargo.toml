@@ -1,0 +1,11 @@
+[package]
+name = "tapir-code"
+version = "0.1.0"
+edition = "2024"
+license = "ISC"
+description = "tapir coding agent"
+
+[[bin]]
+name = "tp"
+path = "src/main.rs"
+
