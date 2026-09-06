@@ -267,6 +267,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn oversized_output_is_tail_truncated_with_a_notice() {
+        let root = temp_root("truncate");
+        let ctx = ToolCtx::new("call");
+        // Emit well over MAX_LINES lines; the tail must survive under a notice
+        // and the head must be dropped. `awk` (POSIX) keeps the test portable
+        // where `seq` is absent.
+        let out = bash_in(
+            &root,
+            args("awk 'BEGIN{for(i=1;i<=3000;i++)print i}'", None),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(
+            out.starts_with("[truncated: showing the tail of the output]\n"),
+            "missing truncation notice: {out:.80?}"
+        );
+        assert!(out.contains("\n3000\n"), "the tail line was dropped");
+        assert!(!out.contains("\n1\n"), "the head line survived truncation");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn output_over_the_byte_ceiling_is_tail_truncated() {
+        let root = temp_root("bytes");
+        let ctx = ToolCtx::new("call");
+        // Few lines (under MAX_LINES) but well over MAX_BYTES, so only the byte
+        // ceiling trips. Each line is ~2 KB; 300 of them clear 256 KB.
+        let out = bash_in(
+            &root,
+            args(
+                "awk 'BEGIN{for(i=1;i<=300;i++){s=\"\";for(j=0;j<2000;j++)s=s\"x\";print i\" \"s}}'",
+                None,
+            ),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(
+            out.starts_with("[truncated: showing the tail of the output]\n"),
+            "missing truncation notice: {out:.80?}"
+        );
+        assert!(out.len() <= MAX_BYTES + 64, "body exceeds the byte ceiling");
+        assert!(out.contains("300 "), "the tail line was dropped");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn stdout_and_stderr_are_combined_on_success() {
+        let root = temp_root("combine");
+        let ctx = ToolCtx::new("call");
+        let out = bash_in(&root, args("echo out; echo err >&2", None), &ctx)
+            .await
+            .unwrap();
+        assert!(out.contains("out"), "stdout missing: {out:?}");
+        assert!(out.contains("err"), "stderr missing: {out:?}");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
     async fn an_explicit_timeout_overrides_the_default() {
         let root = temp_root("override");
         let ctx = ToolCtx::new("call");

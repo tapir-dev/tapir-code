@@ -4,9 +4,9 @@
 //! End-to-end tests for the one-shot run driver, driven by a local scripted
 //! [`Provider`] (no network). They assert the split between assistant text on
 //! stdout and tool activity on stderr, and the behavior of `--no-tools`,
-//! `--quiet`, and `--max-tool-iterations`. A test per file tool (`read`,
-//! `write`, `edit`) drives a scripted call against a temp workspace and asserts
-//! its filesystem effect.
+//! `--quiet`, and `--max-tool-iterations`. A test per coding tool (`read`,
+//! `write`, `edit`, `bash`) drives a scripted call against a temp workspace and
+//! asserts its filesystem effect.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -289,6 +289,42 @@ async fn a_write_call_creates_a_file_in_the_workspace() {
     assert_eq!(
         std::fs::read_to_string(root.join("src/new.rs")).unwrap(),
         "fn main() {}\n"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[tokio::test]
+async fn a_bash_call_runs_a_command_in_the_workspace() {
+    let root = enter_temp_workspace("bash");
+    let provider = ScriptedProvider::new(vec![
+        tool_calls_script(&[(
+            "call_1",
+            "bash",
+            json!({"command": "echo built > out.txt"}),
+        )]),
+        text_script("ran it"),
+    ]);
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    drive(
+        &cli("build it", false, false, 25),
+        Arc::new(provider),
+        &mut out,
+        &mut err,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(String::from_utf8(out).unwrap(), "ran it\n");
+    let err = String::from_utf8(err).unwrap();
+    assert!(
+        err.contains("bash(echo built > out.txt)"),
+        "stderr was: {err:?}"
+    );
+    assert!(!err.contains("[error]"), "bash should not error: {err:?}");
+    assert_eq!(
+        std::fs::read_to_string(root.join("out.txt")).unwrap(),
+        "built\n"
     );
     std::fs::remove_dir_all(&root).ok();
 }
