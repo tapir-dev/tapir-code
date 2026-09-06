@@ -34,7 +34,8 @@ pub struct ReadArgs {
 ///
 /// # Errors
 /// Returns a [`ToolError`] when the path escapes the root, the file cannot be
-/// read, its bytes are not UTF-8 text, or `offset` points past the end.
+/// read, or `offset` points past the end. Binary or non-UTF-8 content is not an
+/// error: it returns `Ok` with a note in place of the bytes.
 pub fn read_in(root: &Path, args: ReadArgs) -> Result<String, ToolError> {
     let path = resolve_in_root(root, &args.path)?;
     let bytes = std::fs::read(&path).map_err(|e| {
