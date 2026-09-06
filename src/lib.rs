@@ -8,6 +8,7 @@
 pub mod cli;
 pub mod prompt;
 pub mod run;
+pub mod tools;
 
 pub use cli::Cli;
 pub use run::run;

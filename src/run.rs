@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: ISC
 // SPDX-FileCopyrightText: 2026 Murilo Ijanc' <murilo@ijanc.org>
 
-//! The one-shot driver: assemble the prompt, build the agent, and stream the
-//! reply's text to stdout.
+//! The one-shot driver: assemble the prompt, build the agent (with the coding
+//! tools by default), run it, and split the output — assistant text to stdout,
+//! tool activity to stderr.
 
+use std::collections::HashMap;
 use std::io::{self, IsTerminal, Read, Write};
 use std::sync::Arc;
 
@@ -17,28 +19,51 @@ use tapir::tapir_provider::{
 
 use crate::cli::Cli;
 use crate::prompt::{
-    assemble_prompt, build_system_prompt, inline_files, split_positionals,
+    assemble_prompt, build_system_prompt, coding_system_prompt, inline_files,
+    split_positionals,
 };
+use crate::tools::coding_tools;
 
-/// Run one prompt to completion, streaming the assistant's text to stdout.
+/// Run one prompt to completion against the provider resolved from `--model`,
+/// writing assistant text to stdout and tool activity to stderr.
 ///
 /// # Errors
 /// Returns an error when no prompt is supplied, a credential is missing, a
 /// referenced file cannot be read, or the agent run fails.
 pub async fn run(cli: Cli) -> Result<()> {
     let provider = resolve_provider(&cli.model, cli.api_key.as_deref())?;
+    let stdout = io::stdout();
+    let stderr = io::stderr();
+    drive(&cli, provider, &mut stdout.lock(), &mut stderr.lock()).await
+}
 
-    let prompt = assemble(&cli)?;
+/// The provider-injectable core of [`run`]: build the agent from `cli` over the
+/// supplied `provider` and render its events to `out` (assistant text) and
+/// `err` (tool activity). A scripted provider drives this in tests.
+///
+/// # Errors
+/// Returns an error when no prompt is supplied, a referenced file cannot be
+/// read, the agent cannot be built, or the run fails.
+pub async fn drive<O: Write, E: Write>(
+    cli: &Cli,
+    provider: Arc<dyn Provider>,
+    out: &mut O,
+    err: &mut E,
+) -> Result<()> {
+    let prompt = assemble(cli)?;
     if prompt.trim().is_empty() {
         bail!("no prompt provided");
     }
-    let system = build_system_prompt(
-        cli.system_prompt.as_deref(),
-        &cli.append_system_prompt,
-    )
-    .context("reading system prompt")?;
 
-    let mut builder = Agent::builder().provider(provider);
+    let tools_active = !cli.no_tools;
+    let system = build_system(cli, tools_active)?;
+
+    let mut builder = Agent::builder()
+        .provider(provider)
+        .max_tool_iterations(cli.max_tool_iterations);
+    if tools_active {
+        builder = builder.tools(coding_tools());
+    }
     if let Some(system) = system {
         builder = builder.system(system);
     }
@@ -49,7 +74,21 @@ pub async fn run(cli: Cli) -> Result<()> {
         .build()
         .map_err(|e| anyhow!("building agent: {e}"))?;
 
-    stream_reply(agent.prompt(prompt)).await
+    render_run(agent.prompt(prompt), out, err, cli.quiet).await
+}
+
+/// Resolve the system prompt: the user's `--system-prompt` replaces the
+/// default; otherwise, when tools are active, the coding-agent prompt is used.
+/// `--append-system-prompt` inputs are appended to whichever base applies.
+fn build_system(cli: &Cli, tools_active: bool) -> Result<Option<String>> {
+    let mut base = cli.system_prompt.clone();
+    if tools_active && base.is_none() {
+        let workspace = std::env::current_dir()
+            .context("resolving the working directory")?;
+        base = Some(coding_system_prompt(&workspace.display().to_string()));
+    }
+    build_system_prompt(base.as_deref(), &cli.append_system_prompt)
+        .context("reading system prompt")
 }
 
 /// Assemble the prompt from piped stdin, `@file` inlines and the message.
@@ -129,24 +168,99 @@ fn resolve_entry(model: &str, api_key: Option<&str>) -> Result<ModelEntry> {
     Ok(entry)
 }
 
-/// Consume the run as an event stream, writing each text delta to stdout.
-async fn stream_reply(mut run: Run) -> Result<()> {
-    let mut stdout = io::stdout();
+/// Consume the run as an event stream: assistant text deltas go to `out`, and
+/// one tool-activity line per completed call goes to `err` (unless `quiet`).
+async fn render_run<O: Write, E: Write>(
+    mut run: Run,
+    out: &mut O,
+    err: &mut E,
+    quiet: bool,
+) -> Result<()> {
+    // The argument summary for each pending call, keyed by call id and captured
+    // from the assistant message before the call runs.
+    let mut summaries: HashMap<String, String> = HashMap::new();
+
     while let Some(event) = run.next().await {
         match event {
             AgentEvent::MessageUpdate {
                 delta: StreamEvent::TextDelta { text, .. },
                 ..
             } => {
-                stdout.write_all(text.as_bytes())?;
-                stdout.flush()?;
+                out.write_all(text.as_bytes())?;
+                out.flush()?;
+            }
+            AgentEvent::MessageEnd { message, .. } if !quiet => {
+                capture_summaries(&message, &mut summaries);
+            }
+            AgentEvent::ToolExecutionEnd { result, .. } if !quiet => {
+                let summary = summaries
+                    .get(&result.tool_call_id)
+                    .map_or("", String::as_str);
+                write_activity(
+                    err,
+                    &result.tool_name,
+                    summary,
+                    result.is_error,
+                )?;
             }
             AgentEvent::Error { error, .. } => return Err(anyhow!("{error}")),
             _ => {}
         }
     }
-    writeln!(stdout)?;
+    writeln!(out)?;
     Ok(())
+}
+
+/// Record an argument summary for every tool call in `message`, so its
+/// activity line can name what the tool ran on.
+fn capture_summaries(
+    message: &AssistantMessage,
+    summaries: &mut HashMap<String, String>,
+) {
+    for part in &message.content {
+        if let ContentPart::ToolCall { id, arguments, .. } = part {
+            summaries.insert(id.clone(), summarize(arguments));
+        }
+    }
+}
+
+/// A short argument summary for a tool call: the `path` for a file tool, or the
+/// first line of the `command` for `bash`, truncated.
+fn summarize(arguments: &serde_json::Value) -> String {
+    if let Some(path) = arguments.get("path").and_then(|v| v.as_str()) {
+        return path.to_string();
+    }
+    if let Some(command) = arguments.get("command").and_then(|v| v.as_str()) {
+        let first = command.lines().next().unwrap_or_default();
+        return truncate_summary(first);
+    }
+    String::new()
+}
+
+/// Clip a summary to a single terminal-friendly line.
+fn truncate_summary(text: &str) -> String {
+    const MAX: usize = 60;
+    if text.chars().count() <= MAX {
+        return text.to_string();
+    }
+    let clipped: String = text.chars().take(MAX).collect();
+    format!("{clipped}…")
+}
+
+/// Write one tool-activity line: the tool name, its argument summary, and an
+/// error flag when the call failed.
+fn write_activity<E: Write>(
+    err: &mut E,
+    name: &str,
+    summary: &str,
+    is_error: bool,
+) -> io::Result<()> {
+    let status = if is_error { " [error]" } else { "" };
+    if summary.is_empty() {
+        writeln!(err, "{name}{status}")
+    } else {
+        writeln!(err, "{name}({summary}){status}")
+    }
 }
 
 #[cfg(test)]

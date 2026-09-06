@@ -35,6 +35,18 @@ pub struct Cli {
     #[arg(long)]
     pub api_key: Option<String>,
 
+    /// Disable the coding tools and run a pure text-only one-shot.
+    #[arg(long)]
+    pub no_tools: bool,
+
+    /// Suppress tool-activity lines on stderr.
+    #[arg(long)]
+    pub quiet: bool,
+
+    /// Cap on the number of tool iterations before the run stops.
+    #[arg(long, default_value_t = 25)]
+    pub max_tool_iterations: usize,
+
     /// Prompt words and `@file` references. A positional starting with `@` is
     /// inlined as a file; the rest join into the message.
     #[arg(value_name = "PROMPT")]
