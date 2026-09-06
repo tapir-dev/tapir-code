@@ -5,11 +5,15 @@
 //! reply's text to stdout.
 
 use std::io::{self, IsTerminal, Read, Write};
+use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
 use futures_util::StreamExt;
 use tapir::prelude::*;
-use tapir::tapir_provider::StreamEvent;
+use tapir::tapir_provider::http::ReqwestClient;
+use tapir::tapir_provider::{
+    ModelEntry, ModelRegistry, Registry, StreamEvent, create_provider,
+};
 
 use crate::cli::Cli;
 use crate::prompt::{
@@ -22,14 +26,7 @@ use crate::prompt::{
 /// Returns an error when no prompt is supplied, a credential is missing, a
 /// referenced file cannot be read, or the agent run fails.
 pub async fn run(cli: Cli) -> Result<()> {
-    let (provider, env_var) = provider_for(&cli.model);
-    apply_api_key(cli.api_key.as_deref(), env_var);
-    if cli.api_key.is_none() && std::env::var_os(env_var).is_none() {
-        bail!(
-            "{env_var} unset (model {}, provider {provider}); pass --api-key or export it",
-            cli.model
-        );
-    }
+    let provider = resolve_provider(&cli.model, cli.api_key.as_deref())?;
 
     let prompt = assemble(&cli)?;
     if prompt.trim().is_empty() {
@@ -41,7 +38,7 @@ pub async fn run(cli: Cli) -> Result<()> {
     )
     .context("reading system prompt")?;
 
-    let mut builder = Agent::builder().model(&cli.model);
+    let mut builder = Agent::builder().provider(provider);
     if let Some(system) = system {
         builder = builder.system(system);
     }
@@ -84,25 +81,52 @@ fn read_piped_stdin() -> Result<Option<String>> {
     }
 }
 
-/// The provider name and credential env var for a model id, inferred from its
-/// prefix (`claude*` is Anthropic, everything else OpenAI).
-fn provider_for(model: &str) -> (&'static str, &'static str) {
-    if model.starts_with("claude") {
-        ("anthropic", "ANTHROPIC_API_KEY")
-    } else {
-        ("openai", "OPENAI_API_KEY")
-    }
+/// Resolve `model` to a concrete provider carrying its credential.
+///
+/// The id is looked up in the SDK's model catalog, not guessed from its prefix,
+/// so provider selection follows the registry. When `--api-key` is supplied it
+/// is passed to the provider explicitly; otherwise the catalog's env-resolved
+/// key is used. Either way the provider is constructed directly, so no
+/// environment mutation happens.
+///
+/// # Errors
+/// Returns an error when the catalog fails to load, the id is unknown, no
+/// credential is available, or the provider cannot be constructed.
+fn resolve_provider(
+    model: &str,
+    api_key: Option<&str>,
+) -> Result<Arc<dyn Provider>> {
+    let entry = resolve_entry(model, api_key)?;
+    create_provider(&entry, ReqwestClient::new())
+        .map_err(|e| anyhow!("building provider for model {model}: {e}"))
 }
 
-/// Set the provider credential env var from `--api-key` so the SDK's offline
-/// `model` path picks it up. The SDK reads the key from the environment at
-/// build time; this is done before the agent is built.
-fn apply_api_key(api_key: Option<&str>, env_var: &str) {
+/// Look up `model` in the catalog and attach the credential to use.
+///
+/// `--api-key`, when given, overrides the catalog's env-resolved key. An
+/// unknown id is a clear error; a model with no key from either source reports
+/// which provider env var to set.
+fn resolve_entry(model: &str, api_key: Option<&str>) -> Result<ModelEntry> {
+    let registry = ModelRegistry::load(None, None)
+        .map_err(|e| anyhow!("loading model catalog: {e}"))?;
+    let mut entry = registry
+        .find_by_id(model)
+        .ok_or_else(|| anyhow!("unknown model id `{model}`"))?
+        .clone();
     if let Some(key) = api_key {
-        // SAFETY: called at startup before any agent turn spawns provider
-        // work, so no other thread is reading the environment concurrently.
-        unsafe { std::env::set_var(env_var, key) };
+        entry.api_key = Some(key.to_owned());
     }
+    if entry.api_key.is_none() {
+        let provider = entry.model.provider.as_str();
+        let env_var = Registry::resolve(provider)
+            .map_or("its API-key environment variable", |info| {
+                info.api_key_env
+            });
+        bail!(
+            "no credential for model {model} (provider {provider}); pass --api-key or set {env_var}"
+        );
+    }
+    Ok(entry)
 }
 
 /// Consume the run as an event stream, writing each text delta to stdout.
@@ -123,4 +147,32 @@ async fn stream_reply(mut run: Run) -> Result<()> {
     }
     writeln!(stdout)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // An explicit key is passed so the check is credential-independent: the
+    // provider is picked from the catalog, never the env.
+    #[test]
+    fn resolve_entry_selects_anthropic_for_a_claude_id() {
+        let entry = resolve_entry("claude-haiku-4-5", Some("sk-test")).unwrap();
+        assert_eq!(entry.model.provider.as_str(), "anthropic");
+        assert_eq!(entry.api_key.as_deref(), Some("sk-test"));
+    }
+
+    #[test]
+    fn resolve_entry_selects_openai_for_a_gpt_id() {
+        let entry = resolve_entry("gpt-5", Some("sk-test")).unwrap();
+        assert_eq!(entry.model.provider.as_str(), "openai");
+        assert_eq!(entry.api_key.as_deref(), Some("sk-test"));
+    }
+
+    #[test]
+    fn resolve_entry_rejects_an_unknown_id() {
+        let err =
+            resolve_entry("no-such-model-xyz", Some("sk-test")).unwrap_err();
+        assert!(err.to_string().contains("unknown model id"));
+    }
 }
