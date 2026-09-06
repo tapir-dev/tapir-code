@@ -9,3 +9,13 @@ description = "tapir coding agent"
 name = "tp"
 path = "src/main.rs"
 
+[lib]
+name = "tapir_code"
+path = "src/lib.rs"
+
+[dependencies]
+tapir = { path = "../tapir/tapir", features = ["anthropic", "openai"] }
+clap = { version = "4.5", features = ["derive"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+futures-util = "0.3"
+anyhow = "1"
