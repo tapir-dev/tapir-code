@@ -4,8 +4,11 @@
 //! End-to-end tests for the one-shot run driver, driven by a local scripted
 //! [`Provider`] (no network). They assert the split between assistant text on
 //! stdout and tool activity on stderr, and the behavior of `--no-tools`,
-//! `--quiet`, and `--max-tool-iterations`.
+//! `--quiet`, and `--max-tool-iterations`. A test per file tool (`read`,
+//! `write`, `edit`) drives a scripted call against a temp workspace and asserts
+//! its filesystem effect.
 
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -134,6 +137,19 @@ fn cli(prompt: &str, no_tools: bool, quiet: bool, max: usize) -> Cli {
     }
 }
 
+/// Make a throwaway directory the process's current directory, so the file
+/// tools — rooted at the working directory — operate inside it. Nextest runs
+/// each test in its own process, so changing the cwd here disturbs no other
+/// test; the process id keeps the directory unique.
+fn enter_temp_workspace(tag: &str) -> PathBuf {
+    let dir = std::env::temp_dir()
+        .join(format!("tp-run-{}-{tag}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let dir = dir.canonicalize().unwrap();
+    std::env::set_current_dir(&dir).unwrap();
+    dir
+}
+
 #[tokio::test]
 async fn assistant_text_to_stdout_and_tool_activity_to_stderr() {
     let provider = ScriptedProvider::new(vec![
@@ -216,4 +232,99 @@ async fn max_tool_iterations_stops_a_looping_run() {
     .await;
 
     assert!(result.is_err(), "the iteration cap should end the run");
+}
+
+#[tokio::test]
+async fn a_read_call_reads_a_file_from_the_workspace() {
+    let root = enter_temp_workspace("read");
+    std::fs::write(root.join("notes.txt"), "first line\nsecond line\n")
+        .unwrap();
+    let provider = ScriptedProvider::new(vec![
+        tool_calls_script(&[("call_1", "read", json!({"path": "notes.txt"}))]),
+        text_script("read it"),
+    ]);
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    drive(
+        &cli("show notes", false, false, 25),
+        Arc::new(provider),
+        &mut out,
+        &mut err,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(String::from_utf8(out).unwrap(), "read it\n");
+    let err = String::from_utf8(err).unwrap();
+    assert!(err.contains("read(notes.txt)"), "stderr was: {err:?}");
+    assert!(!err.contains("[error]"), "read should not error: {err:?}");
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[tokio::test]
+async fn a_write_call_creates_a_file_in_the_workspace() {
+    let root = enter_temp_workspace("write");
+    let provider = ScriptedProvider::new(vec![
+        tool_calls_script(&[(
+            "call_1",
+            "write",
+            json!({"path": "src/new.rs", "content": "fn main() {}\n"}),
+        )]),
+        text_script("wrote it"),
+    ]);
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    drive(
+        &cli("create the file", false, false, 25),
+        Arc::new(provider),
+        &mut out,
+        &mut err,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(String::from_utf8(out).unwrap(), "wrote it\n");
+    let err = String::from_utf8(err).unwrap();
+    assert!(err.contains("write(src/new.rs)"), "stderr was: {err:?}");
+    assert_eq!(
+        std::fs::read_to_string(root.join("src/new.rs")).unwrap(),
+        "fn main() {}\n"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[tokio::test]
+async fn an_edit_call_replaces_text_in_a_file() {
+    let root = enter_temp_workspace("edit");
+    std::fs::write(root.join("lib.rs"), "let x = 1;\nlet y = 2;\n").unwrap();
+    let provider = ScriptedProvider::new(vec![
+        tool_calls_script(&[(
+            "call_1",
+            "edit",
+            json!({
+                "path": "lib.rs",
+                "edits": [{"old_text": "let x = 1;", "new_text": "let x = 42;"}],
+            }),
+        )]),
+        text_script("edited it"),
+    ]);
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    drive(
+        &cli("change x", false, false, 25),
+        Arc::new(provider),
+        &mut out,
+        &mut err,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(String::from_utf8(out).unwrap(), "edited it\n");
+    let err = String::from_utf8(err).unwrap();
+    assert!(err.contains("edit(lib.rs)"), "stderr was: {err:?}");
+    assert_eq!(
+        std::fs::read_to_string(root.join("lib.rs")).unwrap(),
+        "let x = 42;\nlet y = 2;\n"
+    );
+    std::fs::remove_dir_all(&root).ok();
 }
